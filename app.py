@@ -1,339 +1,37 @@
-# app.py — Éditeur Web Qwen-Image-Edit (FastAPI)
+"""FastAPI web studio for Qwen image editing models.
+
+This app supports the new Qwen-Edit-2509 Multiple Angles model which
+introduces multi-image editing, extra guidance controls and a richer
+front-end experience.
+"""
 from __future__ import annotations
-import io, os, base64, asyncio
-from typing import Optional
-from PIL import Image
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+
+import asyncio
+import base64
+import io
+import os
+from typing import List, Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from PIL import Image
 
 INFERENCE_MODE = os.getenv("INFERENCE_MODE", "local").lower()  # "local" | "endpoint"
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen-Image-Edit")
+MODEL_ID = os.getenv("MODEL_ID", "dx8152/Qwen-Edit-2509-Multiple-angles")
 ENDPOINT_URL = os.getenv("ENDPOINT_URL", "")  # si INFERENCE_MODE=endpoint
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 DEVICE = os.getenv("DEVICE", "cuda")  # "cuda" | "cpu"
 DTYPE = os.getenv("DTYPE", "bfloat16")  # "bfloat16" | "float16" | "float32"
-MAX_SIDE_DEFAULT = int(os.getenv("MAX_SIDE", 1024))
-
-app = FastAPI(title="Qwen-Image-Edit Web Editor")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
-)
-
-# ---------- Chargement pipeline local (optionnel) ----------
-pipe = None
-if INFERENCE_MODE == "local":
-    try:
-        import torch
-        from diffusers import QwenImageEditPipeline
-        dtype_map = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }
-        torch.set_grad_enabled(False)
-        pipe = QwenImageEditPipeline.from_pretrained(MODEL_ID)
-        pipe.to(dtype_map.get(DTYPE, torch.bfloat16))
-        pipe.to(DEVICE)
-        pipe.set_progress_bar_config(disable=None)
-    except Exception as e:
-        raise RuntimeError(f"Échec du chargement du pipeline local: {e}")
-
-# ---------- Utilitaires ----------
-
-def smart_resize(img: Image.Image, max_side: int = MAX_SIDE_DEFAULT) -> Image.Image:
-    w, h = img.size
-    if max(w, h) <= max_side:
-        return img
-    if w >= h:
-        new_w = max_side
-        new_h = int(h * (max_side / w))
-    else:
-        new_h = max_side
-        new_w = int(w * (max_side / h))
-    return img.resize((new_w, new_h), Image.LANCZOS)
-
-async def run_local_inference(
-    image: Image.Image,
-    prompt: str,
-    negative_prompt: str = "",
-    num_inference_steps: int = 30,
-    true_cfg_scale: float = 4.0,
-    seed: Optional[int] = None,
-):
-    import torch
-    gen = torch.manual_seed(seed) if seed is not None else torch.Generator(device=DEVICE)
-    inputs = dict(
-        image=image,
-        prompt=prompt,
-        negative_prompt=negative_prompt if negative_prompt else " ",
-        num_inference_steps=num_inference_steps,
-        true_cfg_scale=true_cfg_scale,
-        generator=gen,
-    )
-    def _run():
-        with torch.inference_mode():
-            out = pipe(**inputs)
-            return out.images[0]
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _run)
-
-async def run_endpoint_inference(
-    image: Image.Image,
-    prompt: str,
-    negative_prompt: str = "",
-    num_inference_steps: int = 30,
-    true_cfg_scale: float = 4.0,
-    seed: Optional[int] = None,
-):
-    import requests
-    if not ENDPOINT_URL:
-        raise HTTPException(500, "ENDPOINT_URL manquant pour INFERENCE_MODE=endpoint")
-    # Encode image en base64
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    payload = {
-        "inputs": {
-            "image": b64,
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "num_inference_steps": num_inference_steps,
-            "true_cfg_scale": true_cfg_scale,
-            "seed": seed,
-        }
-    }
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-    r = requests.post(ENDPOINT_URL, json=payload, headers=headers, timeout=600)
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"Endpoint error: {r.text[:300]}")
-    # On accepte deux formats: {image: b64} ou bien bytes direct
-    try:
-        data = r.json()
-        if isinstance(data, dict) and "image" in data:
-            out_b64 = data["image"]
-            img_bytes = base64.b64decode(out_b64)
-        else:
-            img_bytes = r.content
-    except Exception:
-        img_bytes = r.content
-    return Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
-# ---------- Routes ----------
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML
-
-@app.post("/api/edit")
-async def api_edit(
-    file: UploadFile = File(...),
-    prompt: str = Form(...),
-    negative_prompt: str = Form("") ,
-    num_inference_steps: int = Form(30),
-    true_cfg_scale: float = Form(4.0),
-    # OPTION 1 — accepter seed vide (string) et convertir proprement
-    seed: Optional[str] = Form(None),
-    max_side: int = Form(MAX_SIDE_DEFAULT),
-):
-    try:
-        content = await file.read()
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-    except Exception:
-        raise HTTPException(400, "Image invalide")
-
-    img = smart_resize(img, max_side=max(256, min(2048, int(max_side))))
-
-    if not prompt.strip():
-        raise HTTPException(400, "Prompt requis")
-
-    # conversion robuste du seed ("" -> None)
-    seed_val: Optional[int]
-    if seed is None:
-        seed_val = None
-    else:
-        s = str(seed).strip()
-        seed_val = int(s) if s != "" else None
-
-    if INFERENCE_MODE == "endpoint":
-        out_img = await run_endpoint_inference(
-            img, prompt, negative_prompt, num_inference_steps, true_cfg_scale, seed_val
-        )
-    else:
-        out_img = await run_local_inference(
-            img, prompt, negative_prompt, num_inference_steps, true_cfg_scale, seed_val
-        )
-
-    out_buf = io.BytesIO()
-    out_img.save(out_buf, format="PNG")
-    b64 = base64.b64encode(out_buf.getvalue()).decode()
-    return JSONResponse({"image_base64": f"data:image/png;base64,{b64}"})
-
-# ---------- HTML (front minimal DSFR) ----------
-HTML = """
-<!doctype html>
-<html lang=\"fr\" data-fr-scheme=\"system\">
-<head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>Qwen‑Image‑Edit — Web Editor</title>
-  <link href=\"https://cdn.jsdelivr.net/npm/@gouvfr/dsfr@1.11.2/dist/dsfr.min.css\" rel=\"stylesheet\">
-  <style>
-    body { padding: 1.25rem; }
-    .thumb { width: 88px; height: 88px; object-fit: cover; border-radius: .5rem; }
-    .grid { display: grid; grid-template-columns: 1fr; gap: 1rem; }
-    @media (min-width: 900px){ .grid { grid-template-columns: 360px 1fr; } }
-    .history { display:flex; gap:.5rem; flex-wrap:wrap; }
-    .visually-hidden { position:absolute; left:-10000px; }
-  </style>
-</head>
-<body>
-  <h1 class=\"fr-h3\">Qwen‑Image‑Edit — éditeur web</h1>
-  <p class=\"fr-text--sm\">Téléversez une image, décrivez l'édition, ajustez les paramètres puis lancez.</p>
-
-  <div class=\"grid\">
-    <form id=\"editForm\" class=\"fr-card fr-p-3w\" style=\"align-self:start;\">
-      <div class=\"fr-input-group\">
-        <label class=\"fr-label\" for=\"file\">Image d'entrée</label>
-        <input class=\"fr-upload\" id=\"file\" name=\"file\" type=\"file\" accept=\"image/*\" required />
-      </div>
-
-      <div class=\"fr-input-group\">
-        <label class=\"fr-label\" for=\"prompt\">Prompt</label>
-        <textarea id=\"prompt\" name=\"prompt\" class=\"fr-input\" rows=\"3\" placeholder=\"Ex: Remplacer le texte de l'enseigne par ‘Boulangerie du Pont’\" required></textarea>
-      </div>
-
-      <div class=\"fr-input-group\">
-        <label class=\"fr-label\" for=\"neg\">Negative prompt <span class=\"fr-text--xs fr-text-mention--grey\">(optionnel)</span></label>
-        <input id=\"neg\" name=\"negative_prompt\" class=\"fr-input\" placeholder=\"artefacts, blur\" />
-      </div>
-
-      <div class=\"fr-grid-row fr-grid-row--gutters\">
-        <div class=\"fr-col-6\">
-          <label class=\"fr-label\" for=\"steps\">Steps: <span id=\"stepsValue\">30</span></label>
-          <input id=\"steps\" name=\"num_inference_steps\" type=\"range\" min=\"10\" max=\"75\" value=\"30\" class=\"fr-range\" />
-        </div>
-        <div class=\"fr-col-6\">
-          <label class=\"fr-label\" for=\"cfg\">true_cfg_scale: <span id=\"cfgValue\">4.0</span></label>
-          <input id=\"cfg\" name=\"true_cfg_scale\" type=\"range\" min=\"0\" max=\"10\" step=\"0.1\" value=\"4.0\" class=\"fr-range\" />
-        </div>
-      </div>
-
-      <div class=\"fr-grid-row fr-grid-row--gutters\">
-        <div class=\"fr-col-6\">
-          <label class=\"fr-label\" for=\"seed\">Seed <span class=\"fr-text--xs fr-text-mention--grey\">(optionnel)</span></label>
-          <input id=\"seed\" name=\"seed\" class=\"fr-input\" type=\"number\" placeholder=\"aléatoire si vide\" />
-        </div>
-        <div class=\"fr-col-6\">
-          <label class=\"fr-label\" for=\"maxside\">Max side (px): <span id=\"maxsideValue\">1024</span></label>
-          <input id=\"maxside\" name=\"max_side\" type=\"range\" min=\"512\" max=\"2048\" step=\"64\" value=\"1024\" class=\"fr-range\" />
-        </div>
-      </div>
-
-      <div class=\"fr-btns-group fr-btns-group--inline-md fr-mt-3w\">
-        <button id=\"runBtn\" class=\"fr-btn\">Lancer l'édition</button>
-        <button id=\"clearBtn\" class=\"fr-btn fr-btn--secondary\" type=\"button\">Effacer</button>
-      </div>
-
-      <p id=\"status\" class=\"fr-text--sm fr-mt-2w\" aria-live=\"polite\"></p>
-    </form>
-
-    <section class=\"fr-card fr-p-3w\">
-      <h2 class=\"fr-h5\">Résultat</h2>
-      <div id=\"previewZone\" class=\"fr-mb-3w\" style=\"min-height: 240px; display:flex; align-items:center; justify-content:center; background:var(--background-alt-grey); border-radius:.5rem;\"></div>
-      <div class=\"history\" id=\"history\"></div>
-    </section>
-  </div>
-
-<script>
-const steps = document.getElementById('steps');
-const cfg = document.getElementById('cfg');
-const maxside = document.getElementById('maxside');
-const stepsValue = document.getElementById('stepsValue');
-const cfgValue = document.getElementById('cfgValue');
-const maxsideValue = document.getElementById('maxsideValue');
-[steps, cfg, maxside].forEach(i => i.addEventListener('input', () => {
-  stepsValue.textContent = steps.value; cfgValue.textContent = cfg.value; maxsideValue.textContent = maxside.value;
-}));
-
-const form = document.getElementById('editForm');
-const statusEl = document.getElementById('status');
-const preview = document.getElementById('previewZone');
-const history = document.getElementById('history');
-
-function showImage(b64){
-  const img = new Image();
-  img.src = b64; img.style.maxWidth = '100%'; img.style.borderRadius = '.5rem';
-  preview.innerHTML = ''; preview.appendChild(img);
-  const t = new Image(); t.src = b64; t.className = 'thumb'; history.prepend(t);
-}
-
-form.addEventListener('submit', async (e) => {
-  e.preventDefault(); statusEl.textContent = '⏳ Génération en cours…';
-  const fd = new FormData(form);
-  try{
-    const res = await fetch('/api/edit', { method:'POST', body: fd });
-    if(!res.ok){ throw new Error(await res.text()); }
-    const data = await res.json();
-    showImage(data.image_base64);
-    statusEl.textContent = '✅ Fini';
-  }catch(err){
-    console.error(err); statusEl.textContent = '❌ ' + (''+err).slice(0,200);
-  }
-});
-
-document.getElementById('clearBtn').addEventListener('click', ()=>{
-  form.reset(); preview.innerHTML = ''; statusEl.textContent = '';
-  stepsValue.textContent = steps.value = 30;
-  cfgValue.textContent = cfg.value = 4.0;
-  maxsideValue.textContent = maxside.value = 1024;
-});
-</script>
-</body>
-</html>
-"""
-root@ai-dev-3:~# cp -aZ /home/ailab/qwen-image-edit/app.py /home/ailab/qwen-image-edit/app.py-OK-25-09-25
-root@ai-dev-3:~# nano /home/ailab/qwen-image-edit/requirements.txt 
-root@ai-dev-3:~# ls -lart /home/ailab/qwen-image-edit/
-total 60
--rw-rw-r-- 1 ailab ailab   697 Aug 20 17:46 .env
--rw-rw-r-- 1 ailab ailab  1609 Aug 20 17:47 run.sh
-drwxr-x--- 7 ailab ailab  4096 Aug 20 18:01 ..
--rw-rw-r-- 1 ailab ailab 11518 Aug 25 09:24 app.py-OK-25-09-25
--rw-rw-r-- 1 ailab ailab 11518 Aug 25 09:24 app.py-OK-14-09-25
--rw-rw-r-- 1 ailab ailab 11518 Aug 25 09:24 app.py
-drwxrwxr-x 2 ailab ailab  4096 Aug 25 09:24 __pycache__
--rw-rw-r-- 1 ailab ailab   304 Sep 26 17:11 requirements.txt
-drwxrwxr-x 3 ailab ailab  4096 Sep 26 17:11 .
-root@ai-dev-3:~# nano /home/ailab/qwen-image-edit/run.sh
-root@ai-dev-3:~# > /home/ailab/qwen-image-edit/app.py
-root@ai-dev-3:~# nano /home/ailab/qwen-image-edit/app.py
-root@ai-dev-3:~# tmux
-[exited]
-root@ai-dev-3:~# cat /home/ailab/qwen-image-edit/app.py
-# app.py — Éditeur Web Qwen-Image-Edit (FastAPI) — multi-image + front DSFR premium
-from __future__ import annotations
-import io, os, base64, asyncio
-from typing import Optional, List
-from PIL import Image
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-INFERENCE_MODE = os.getenv("INFERENCE_MODE", "local").lower()  # "local" | "endpoint"
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen-Image-Edit-2509")
-ENDPOINT_URL = os.getenv("ENDPOINT_URL", "")  # si INFERENCE_MODE=endpoint
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-DEVICE = os.getenv("DEVICE", "cuda")          # "cuda" | "cpu"
-DTYPE = os.getenv("DTYPE", "bfloat16")        # "bfloat16" | "float16" | "float32"
 MAX_SIDE_DEFAULT = int(os.getenv("MAX_SIDE", 1280))
 
 app = FastAPI(title="Qwen-Image-Edit — Web Studio (multi)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------- Chargement pipeline local ----------
@@ -343,11 +41,12 @@ if INFERENCE_MODE == "local":
     try:
         import torch
         from diffusers import QwenImageEditPipeline
+
         try:
             # Nouveau pipeline pour 2509 (multi-images amélioré)
-            from diffusers import QwenImageEditPlusPipeline
-        except Exception:
-            QwenImageEditPlusPipeline = None
+            from diffusers import QwenImageEditPlusPipeline  # type: ignore
+        except Exception:  # pragma: no cover - diffusers < 0.32
+            QwenImageEditPlusPipeline = None  # type: ignore
 
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -356,10 +55,15 @@ if INFERENCE_MODE == "local":
         }
         torch.set_grad_enabled(False)
 
-        use_plus = (("2509" in MODEL_ID) or MODEL_ID.endswith("-2509")) and (QwenImageEditPlusPipeline is not None)
+        plus_cls = globals().get("QwenImageEditPlusPipeline")
+        use_plus = (
+            ("2509" in MODEL_ID or MODEL_ID.endswith("-2509"))
+            and plus_cls is not None
+        )
         if use_plus:
-            pipe = QwenImageEditPlusPipeline.from_pretrained(
-                MODEL_ID, torch_dtype=dtype_map.get(DTYPE, torch.bfloat16)
+            pipe = plus_cls.from_pretrained(
+                MODEL_ID,
+                torch_dtype=dtype_map.get(DTYPE, torch.bfloat16),
             )
             pipeline_name = "QwenImageEditPlusPipeline"
         else:
@@ -369,8 +73,9 @@ if INFERENCE_MODE == "local":
 
         pipe.to(DEVICE)
         pipe.set_progress_bar_config(disable=None)
-    except Exception as e:
-        raise RuntimeError(f"Échec du chargement du pipeline local: {e}")
+    except Exception as exc:  # pragma: no cover - import/runtime guard
+        raise RuntimeError(f"Échec du chargement du pipeline local: {exc}")
+
 
 # ---------- Utilitaires ----------
 
@@ -386,6 +91,7 @@ def smart_resize(img: Image.Image, max_side: int = MAX_SIDE_DEFAULT) -> Image.Im
         new_w = int(w * (max_side / h))
     return img.resize((new_w, new_h), Image.LANCZOS)
 
+
 async def run_local_inference_one(
     image: Image.Image,
     prompt: str,
@@ -394,10 +100,18 @@ async def run_local_inference_one(
     true_cfg_scale: float = 4.0,
     guidance_scale: float = 1.0,
     seed: Optional[int] = None,
-):
+) -> Image.Image:
     """Traite une image (séquentiel pour limiter la VRAM)."""
     import torch
-    gen = torch.manual_seed(seed) if seed is not None else torch.Generator(device=DEVICE)
+
+    if pipe is None:
+        raise RuntimeError("Pipeline local non initialisé")
+
+    generator = (
+        torch.manual_seed(seed)
+        if seed is not None
+        else torch.Generator(device=DEVICE)
+    )
 
     inputs = dict(
         image=image,
@@ -405,18 +119,19 @@ async def run_local_inference_one(
         negative_prompt=negative_prompt if negative_prompt else " ",
         num_inference_steps=num_inference_steps,
         true_cfg_scale=true_cfg_scale,
-        guidance_scale=guidance_scale,      # supporté par 2509, ignoré par v1
-        generator=gen,
+        guidance_scale=guidance_scale,  # supporté par 2509, ignoré par v1
+        generator=generator,
         num_images_per_prompt=1,
     )
 
-    def _run():
+    def _run() -> Image.Image:
         with torch.inference_mode():
-            out = pipe(**inputs)
-            return out.images[0]
+            output = pipe(**inputs)
+            return output.images[0]
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _run)
+
 
 async def run_local_inference_multi(
     images: List[Image.Image],
@@ -426,16 +141,22 @@ async def run_local_inference_multi(
     true_cfg_scale: float,
     guidance_scale: float,
     seed: Optional[int],
-):
+) -> List[Image.Image]:
     results: List[Image.Image] = []
     for idx, img in enumerate(images):
-        s = None if seed is None else (seed + idx)
-        out_img = await run_local_inference_one(
-            img, prompt, negative_prompt,
-            num_inference_steps, true_cfg_scale, guidance_scale, s
+        computed_seed = None if seed is None else (seed + idx)
+        result = await run_local_inference_one(
+            img,
+            prompt,
+            negative_prompt,
+            num_inference_steps,
+            true_cfg_scale,
+            guidance_scale,
+            computed_seed,
         )
-        results.append(out_img)
+        results.append(result)
     return results
+
 
 async def run_endpoint_inference_multi(
     images: List[Image.Image],
@@ -445,10 +166,13 @@ async def run_endpoint_inference_multi(
     true_cfg_scale: float = 4.0,
     guidance_scale: float = 1.0,
     seed: Optional[int] = None,
-):
+) -> List[Image.Image]:
     import requests
+
     if not ENDPOINT_URL:
-        raise HTTPException(500, "ENDPOINT_URL manquant pour INFERENCE_MODE=endpoint")
+        raise HTTPException(
+            500, "ENDPOINT_URL manquant pour INFERENCE_MODE=endpoint"
+        )
 
     b64_list = []
     for img in images:
@@ -472,31 +196,38 @@ async def run_endpoint_inference_multi(
         payload["inputs"]["images"] = b64_list
 
     headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-    r = requests.post(ENDPOINT_URL, json=payload, headers=headers, timeout=1200)
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"Endpoint error: {r.text[:500]}")
+    response = requests.post(
+        ENDPOINT_URL, json=payload, headers=headers, timeout=1200
+    )
+    if response.status_code != 200:
+        raise HTTPException(
+            response.status_code,
+            f"Endpoint error: {response.text[:500]}",
+        )
 
     try:
-        data = r.json()
-        outs: List[bytes] = []
+        data = response.json()
+        outputs: List[bytes] = []
         if isinstance(data, dict):
             if "images" in data and isinstance(data["images"], list):
-                for it in data["images"]:
-                    if isinstance(it, str):
-                        outs.append(base64.b64decode(it))
+                for item in data["images"]:
+                    if isinstance(item, str):
+                        outputs.append(base64.b64decode(item))
             elif "image" in data and isinstance(data["image"], str):
-                outs.append(base64.b64decode(data["image"]))
-        if outs:
-            return [Image.open(io.BytesIO(b)).convert("RGB") for b in outs]
+                outputs.append(base64.b64decode(data["image"]))
+        if outputs:
+            return [Image.open(io.BytesIO(b)).convert("RGB") for b in outputs]
     except Exception:
         pass
 
-    return [Image.open(io.BytesIO(r.content)).convert("RGB")]
+    return [Image.open(io.BytesIO(response.content)).convert("RGB")]
+
 
 # ---------- Routes ----------
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index() -> str:
     return HTML
+
 
 @app.post("/api/edit")
 async def api_edit(
@@ -508,45 +239,64 @@ async def api_edit(
     guidance_scale: float = Form(1.0),
     seed: Optional[str] = Form(None),
     max_side: int = Form(MAX_SIDE_DEFAULT),
-):
+) -> JSONResponse:
     if not prompt or not prompt.strip():
         raise HTTPException(400, "Prompt requis")
 
     imgs: List[Image.Image] = []
-    for f in files:
+    for file in files:
         try:
-            content = await f.read()
+            content = await file.read()
             img = Image.open(io.BytesIO(content)).convert("RGB")
-        except Exception:
-            raise HTTPException(400, f"Image invalide: {f.filename}")
-        imgs.append(smart_resize(img, max_side=max(256, min(4096, int(max_side)))))
+        except Exception as exc:
+            raise HTTPException(400, f"Image invalide: {file.filename}") from exc
+        imgs.append(
+            smart_resize(
+                img,
+                max_side=max(256, min(4096, int(max_side))),
+            )
+        )
 
     if not imgs:
         raise HTTPException(400, "Aucune image fournie")
 
-    seed_val: Optional[int]
     if seed is None:
-        seed_val = None
+        seed_value: Optional[int] = None
     else:
-        s = str(seed).strip()
-        seed_val = int(s) if s != "" else None
+        string_seed = str(seed).strip()
+        seed_value = int(string_seed) if string_seed != "" else None
 
     if INFERENCE_MODE == "endpoint":
         out_imgs = await run_endpoint_inference_multi(
-            imgs, prompt, negative_prompt, num_inference_steps, true_cfg_scale, guidance_scale, seed_val
+            imgs,
+            prompt,
+            negative_prompt,
+            num_inference_steps,
+            true_cfg_scale,
+            guidance_scale,
+            seed_value,
         )
     else:
         out_imgs = await run_local_inference_multi(
-            imgs, prompt, negative_prompt, num_inference_steps, true_cfg_scale, guidance_scale, seed_val
+            imgs,
+            prompt,
+            negative_prompt,
+            num_inference_steps,
+            true_cfg_scale,
+            guidance_scale,
+            seed_value,
         )
 
-    out_b64_list = []
+    outputs_base64: List[str] = []
     for im in out_imgs:
         buf = io.BytesIO()
         im.save(buf, format="PNG")
-        out_b64_list.append("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
+        outputs_base64.append(
+            "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        )
 
-    return JSONResponse({"images_base64": out_b64_list, "pipeline": pipeline_name})
+    return JSONResponse({"images_base64": outputs_base64, "pipeline": pipeline_name})
+
 
 # ---------- HTML (front DSFR premium + drag&drop + comparaison) ----------
 HTML = r"""
@@ -564,18 +314,13 @@ HTML = r"""
     @media (max-width: 1024px){ .layout { grid-template-columns: 1fr; } }
     .card { background: var(--background-default-grey); border-radius: 1rem; box-shadow: 0 10px 30px rgba(0,0,0,.05); }
     .pad { padding: 1rem 1.25rem; }
-    .pane { background: var(--pane-bg); border-radius: .75rem; padding: 1rem; }
-    .drop { border: 2px dashed var(--border-default-grey); border-radius: .75rem; padding: 1rem; text-align: center; transition: .2s; }
+    .drop { border: 2px dashed var(--border-default-grey); border-radius: .75rem; padding: 1rem; text-align: center; transition:.2s; }
     .drop.drag { border-color: var(--border-active-blue-france); background: color-mix(in oklab, var(--background-contrast-grey), transparent 85%); }
     .chips { display:flex; gap:.5rem; flex-wrap:wrap; }
     .thumb { width: 88px; height: 88px; object-fit: cover; border-radius: .5rem; }
     .grid { display:grid; gap: .75rem; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); }
     figure { margin:0; }
     figcaption { font-size: .75rem; color: var(--text-mention-grey); margin-top:.35rem; display:flex; justify-content:space-between; align-items:center; gap:.5rem; }
-    .btn-icon { inline-size: 2.25rem; block-size: 2.25rem; border-radius: .5rem; display:grid; place-items:center; }
-    .kv { display:grid; grid-template-columns: 1fr auto; gap:.75rem .75rem; align-items:center; }
-    .kv label { color: var(--text-mention-grey); }
-    .split { display:grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
     .compare { position:relative; overflow:hidden; border-radius:.75rem; }
     .compare > img { display:block; width:100%; height:auto; }
     .compare > .top { position:absolute; inset:0; overflow:hidden; }
@@ -603,31 +348,25 @@ HTML = r"""
           <input id="neg" name="negative_prompt" class="fr-input" placeholder="artefacts, blur" />
         </div>
 
-        <div class="kv fr-mb-2w">
-          <label for="steps">Steps</label>
-          <div>
-            <span id="stepsValue" class="fr-badge fr-badge--new fr-mr-1w">30</span>
+        <div class="fr-grid-row fr-grid-row--gutters fr-mb-2w">
+          <div class="fr-col-12">
+            <label for="steps" class="fr-label">Steps <span id="stepsValue" class="fr-badge fr-badge--new fr-ml-1w">30</span></label>
             <input id="steps" name="num_inference_steps" type="range" min="10" max="75" value="30" class="fr-range" />
           </div>
-          
-          <label for="cfg">true_cfg_scale</label>
-          <div>
-            <span id="cfgValue" class="fr-badge fr-mr-1w">4.0</span>
+          <div class="fr-col-12">
+            <label for="cfg" class="fr-label">true_cfg_scale <span id="cfgValue" class="fr-badge fr-ml-1w">4.0</span></label>
             <input id="cfg" name="true_cfg_scale" type="range" min="0" max="10" step="0.1" value="4.0" class="fr-range" />
           </div>
-
-          <label for="guidance">guidance_scale</label>
-          <div>
-            <span id="guidanceValue" class="fr-badge fr-mr-1w">1.0</span>
+          <div class="fr-col-12">
+            <label for="guidance" class="fr-label">guidance_scale <span id="guidanceValue" class="fr-badge fr-ml-1w">1.0</span></label>
             <input id="guidance" name="guidance_scale" type="range" min="0" max="10" step="0.1" value="1.0" class="fr-range" />
           </div>
-
-          <label for="seed">Seed <span class="fr-text--xs fr-text-mention--grey">(optionnel)</span></label>
-          <input id="seed" name="seed" class="fr-input" type="number" placeholder="aléatoire si vide" />
-
-          <label for="maxside">Max side (px)</label>
-          <div>
-            <span id="maxsideValue" class="fr-badge fr-mr-1w">1280</span>
+          <div class="fr-col-12">
+            <label for="seed" class="fr-label">Seed <span class="fr-text--xs fr-text-mention--grey">(optionnel)</span></label>
+            <input id="seed" name="seed" class="fr-input" type="number" placeholder="aléatoire si vide" />
+          </div>
+          <div class="fr-col-12">
+            <label for="maxside" class="fr-label">Max side (px) <span id="maxsideValue" class="fr-badge fr-ml-1w">1280</span></label>
             <input id="maxside" name="max_side" type="range" min="512" max="4096" step="64" value="1280" class="fr-range" />
           </div>
         </div>
@@ -714,7 +453,6 @@ function updateSelection(files){
   });
 }
 
-// Drag & drop
 ['dragenter','dragover'].forEach(ev=> drop.addEventListener(ev, e=>{ e.preventDefault(); drop.classList.add('drag'); }));
 ['dragleave','drop'].forEach(ev=> drop.addEventListener(ev, e=>{ e.preventDefault(); drop.classList.remove('drag'); }));
 drop.addEventListener('click', ()=> fileInput.click());
@@ -737,9 +475,18 @@ function makeControls(b64){
   });
   const cp = document.createElement('button'); cp.type = 'button'; cp.className = 'fr-btn fr-btn--tertiary fr-btn--sm'; cp.textContent = 'Copier';
   cp.addEventListener('click', async ()=>{
-    try { const blob = await (await fetch(b64)).blob(); await navigator.clipboard.write([new ClipboardItem({[blob.type]: blob})]); cp.textContent='Copié ✓'; setTimeout(()=>cp.textContent='Copier',1200); } catch(e){ alert('Clipboard non supporté'); }
+    try {
+      const blob = await (await fetch(b64)).blob();
+      await navigator.clipboard.write([new ClipboardItem({[blob.type]: blob})]);
+      cp.textContent='Copié ✓';
+      setTimeout(()=>cp.textContent='Copier',1200);
+    } catch(e){
+      alert('Clipboard non supporté');
+    }
   });
-  div.appendChild(dl); div.appendChild(cp); return div;
+  div.appendChild(dl);
+  div.appendChild(cp);
+  return div;
 }
 
 function makeCompare(beforeUrl, afterB64){
@@ -750,11 +497,14 @@ function makeCompare(beforeUrl, afterB64){
   const divider = document.createElement('div'); divider.className='divider';
   const slider = document.createElement('input'); slider.type='range'; slider.min=0; slider.max=100; slider.value=50;
   slider.addEventListener('input', ()=>{
-    const p = slider.value/100; topWrap.style.clipPath = `inset(0 ${(1-p)*100}% 0 0)`; divider.style.left = (p*100)+'%';
+    const p = slider.value/100;
+    topWrap.style.clipPath = `inset(0 ${(1-p)*100}% 0 0)`;
+    divider.style.left = (p*100)+'%';
   });
-  // init
   topWrap.style.clipPath = 'inset(0 50% 0 0)';
-  wrap.appendChild(topWrap); wrap.appendChild(divider); wrap.appendChild(slider);
+  wrap.appendChild(topWrap);
+  wrap.appendChild(divider);
+  wrap.appendChild(slider);
   return wrap;
 }
 
@@ -785,12 +535,20 @@ function showOutputs(inputs, outputs){
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault(); statusEl.textContent = '⏳ Génération en cours…';
-  if (!fileInput.files || fileInput.files.length === 0){ statusEl.textContent='❌ Aucune image sélectionnée'; return; }
+  if (!fileInput.files || fileInput.files.length === 0){
+    statusEl.textContent='❌ Aucune image sélectionnée';
+    return;
+  }
 
   const fd = new FormData();
   for (const f of fileInput.files) fd.append('files', f);
   ['prompt','negative_prompt','num_inference_steps','true_cfg_scale','guidance_scale','seed','max_side']
-    .forEach(k => { const v = document.getElementById(k)?.value; if (v !== undefined && v !== null) fd.append(k, v); });
+    .forEach(k => {
+      const el = document.getElementById(k);
+      if(!el) return;
+      const v = el.value;
+      if (v !== undefined && v !== null) fd.append(k, v);
+    });
 
   try{
     const res = await fetch('/api/edit', { method:'POST', body: fd });
@@ -804,13 +562,17 @@ form.addEventListener('submit', async (e) => {
       throw new Error('Réponse invalide');
     }
   }catch(err){
-    console.error(err); statusEl.textContent = '❌ ' + (''+err).slice(0,300);
+    console.error(err);
+    statusEl.textContent = '❌ ' + (''+err).slice(0,300);
   }
 });
 
-// Reset
  document.getElementById('clearBtn').addEventListener('click', ()=>{
-  form.reset(); outGrid.innerHTML=''; history.innerHTML=''; inThumbs.innerHTML=''; selInfo.textContent='Aucun fichier';
+  form.reset();
+  outGrid.innerHTML='';
+  history.innerHTML='';
+  inThumbs.innerHTML='';
+  selInfo.textContent='Aucun fichier';
   stepsValue.textContent = steps.value = 30;
   cfgValue.textContent = cfg.value = 4.0;
   guidanceValue.textContent = guidance.value = 1.0;
