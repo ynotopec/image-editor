@@ -9,7 +9,7 @@ Elle est conçue pour fonctionner **localement** (GPU/CPU) ou via un **endpoint 
 - 🖱️ **Front-end DSFR** (Design System de l’État français) : UI moderne, responsive et accessible  
 - 🔁 **Comparaison avant/après** : slider interactif pour comparer les résultats  
 - 📦 **Téléchargement & copier/coller** des images générées  
-- 🚀 Compatible avec le nouveau modèle **[Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509)**
+- 🚀 Compatible avec la mise à jour **[Qwen-Edit-2509 Multiple Angles](https://huggingface.co/dx8152/Qwen-Edit-2509-Multiple-angles)**
 
 ---
 
@@ -56,7 +56,7 @@ L’application sera disponible sur : [http://localhost:8080](http://localhost:8
 | Variable         | Description                                      | Défaut                      |
 | ---------------- | ------------------------------------------------ | --------------------------- |
 | `INFERENCE_MODE` | `local` (GPU/CPU) ou `endpoint`                  | `local`                     |
-| `MODEL_ID`       | Modèle Hugging Face                              | `Qwen/Qwen-Image-Edit-2509` |
+| `MODEL_ID`       | Modèle Hugging Face                              | `dx8152/Qwen-Edit-2509-Multiple-angles` |
 | `ENDPOINT_URL`   | URL de l’endpoint si `INFERENCE_MODE=endpoint`   | *(vide)*                    |
 | `HF_TOKEN`       | Token Hugging Face si endpoint protégé           | *(vide)*                    |
 | `DEVICE`         | `cuda` ou `cpu`                                  | `cuda`                      |
@@ -71,7 +71,7 @@ Pour utiliser un modèle hébergé sur Hugging Face Inference API :
 
 ```bash
 export INFERENCE_MODE=endpoint
-export ENDPOINT_URL=https://api-inference.huggingface.co/models/Qwen/Qwen-Image-Edit-2509
+export ENDPOINT_URL=https://api-inference.huggingface.co/models/dx8152/Qwen-Edit-2509-Multiple-angles
 export HF_TOKEN=hf_xxxxxxxxxxxxxxx
 ```
 
@@ -102,7 +102,7 @@ Réponse JSON :
 
 * 🐍 [FastAPI](https://fastapi.tiangolo.com/) — backend web asynchrone ultra-rapide
 * 🤗 [Diffusers](https://huggingface.co/docs/diffusers) — pipeline d’édition d’images Qwen
-* 🧠 [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) — modèle d’édition IA
+* 🧠 [Qwen-Edit-2509 Multiple Angles](https://huggingface.co/dx8152/Qwen-Edit-2509-Multiple-angles) — modèle d’édition IA
 * 🖥️ [DSFR](https://www.systeme-de-design.gouv.fr/) — Design System de l’État français
 
 ---
