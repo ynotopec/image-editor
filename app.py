@@ -120,8 +120,8 @@ async def unload_pipeline_if_idle() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    if INFERENCE_MODE == "local":
-        await ensure_local_pipeline_loaded()
+    # Keep startup resilient: do not hard-fail if model dependencies are missing.
+    # Pipeline is loaded lazily on first /api/edit request.
     asyncio.create_task(unload_pipeline_if_idle())
 
 
@@ -344,7 +344,10 @@ async def api_edit(
             seed_value,
         )
     else:
-        await ensure_local_pipeline_loaded()
+        try:
+            await ensure_local_pipeline_loaded()
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
         out_imgs = await run_local_inference_multi(
             imgs,
             prompt,
