@@ -10,20 +10,26 @@ import asyncio
 import base64
 import io
 import os
+import time
 from typing import List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image
 
 INFERENCE_MODE = os.getenv("INFERENCE_MODE", "local").lower()  # "local" | "endpoint"
-MODEL_ID = os.getenv("MODEL_ID", "dx8152/Qwen-Edit-2509-Multiple-angles")
+MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen-Image-Edit-2511")
 ENDPOINT_URL = os.getenv("ENDPOINT_URL", "")  # si INFERENCE_MODE=endpoint
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 DEVICE = os.getenv("DEVICE", "cuda")  # "cuda" | "cpu"
 DTYPE = os.getenv("DTYPE", "bfloat16")  # "bfloat16" | "float16" | "float32"
 MAX_SIDE_DEFAULT = int(os.getenv("MAX_SIDE", 1280))
+API_TOKEN = os.getenv("API_TOKEN", "")
+UNLOAD_IDLE_SECONDS = int(os.getenv("UNLOAD_IDLE_SECONDS", "300"))
+
+last_activity_ts = time.time()
+pipe_lock = asyncio.Lock()
 
 app = FastAPI(title="Qwen-Image-Edit — Web Studio (multi)")
 app.add_middleware(
@@ -37,44 +43,89 @@ app.add_middleware(
 # ---------- Chargement pipeline local ----------
 pipe = None
 pipeline_name = "QwenImageEditPipeline"
-if INFERENCE_MODE == "local":
-    try:
-        import torch
-        from diffusers import QwenImageEditPipeline
 
+
+async def ensure_local_pipeline_loaded() -> None:
+    global pipe, pipeline_name
+    if INFERENCE_MODE != "local":
+        return
+    if pipe is not None:
+        return
+
+    async with pipe_lock:
+        if pipe is not None:
+            return
         try:
-            # Nouveau pipeline pour 2509 (multi-images amélioré)
-            from diffusers import QwenImageEditPlusPipeline  # type: ignore
-        except Exception:  # pragma: no cover - diffusers < 0.32
-            QwenImageEditPlusPipeline = None  # type: ignore
+            import torch
+            from diffusers import QwenImageEditPipeline
 
-        dtype_map = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }
-        torch.set_grad_enabled(False)
+            try:
+                from diffusers import QwenImageEditPlusPipeline  # type: ignore
+            except Exception:
+                QwenImageEditPlusPipeline = None  # type: ignore
 
-        plus_cls = globals().get("QwenImageEditPlusPipeline")
-        use_plus = (
-            ("2509" in MODEL_ID or MODEL_ID.endswith("-2509"))
-            and plus_cls is not None
-        )
-        if use_plus:
-            pipe = plus_cls.from_pretrained(
-                MODEL_ID,
-                torch_dtype=dtype_map.get(DTYPE, torch.bfloat16),
+            if DEVICE.startswith("cuda") and not torch.cuda.is_available():
+                raise RuntimeError("DEVICE=cuda mais CUDA indisponible. Vérifiez pilotes NVIDIA/CUDA et le runtime du conteneur.")
+
+            dtype_map = {
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
+            }
+            torch.set_grad_enabled(False)
+
+            use_plus = (
+                any(tag in MODEL_ID for tag in ("2509", "2511", "Multiple-Angles", "LoRA"))
+                and QwenImageEditPlusPipeline is not None
             )
-            pipeline_name = "QwenImageEditPlusPipeline"
-        else:
-            pipe = QwenImageEditPipeline.from_pretrained(MODEL_ID)
-            pipe.to(dtype_map.get(DTYPE, torch.bfloat16))
-            pipeline_name = "QwenImageEditPipeline"
+            if use_plus:
+                pipe = QwenImageEditPlusPipeline.from_pretrained(
+                    MODEL_ID,
+                    torch_dtype=dtype_map.get(DTYPE, torch.bfloat16),
+                )
+                pipeline_name = "QwenImageEditPlusPipeline"
+            else:
+                pipe = QwenImageEditPipeline.from_pretrained(MODEL_ID)
+                pipe.to(dtype_map.get(DTYPE, torch.bfloat16))
+                pipeline_name = "QwenImageEditPipeline"
 
-        pipe.to(DEVICE)
-        pipe.set_progress_bar_config(disable=None)
-    except Exception as exc:  # pragma: no cover - import/runtime guard
-        raise RuntimeError(f"Échec du chargement du pipeline local: {exc}")
+            pipe.to(DEVICE)
+            pipe.set_progress_bar_config(disable=None)
+        except Exception as exc:
+            raise RuntimeError(f"Échec du chargement du pipeline local: {exc}")
+
+
+async def unload_pipeline_if_idle() -> None:
+    global pipe
+    if INFERENCE_MODE != "local" or UNLOAD_IDLE_SECONDS <= 0:
+        return
+
+    while True:
+        await asyncio.sleep(15)
+        idle_for = time.time() - last_activity_ts
+        if idle_for < UNLOAD_IDLE_SECONDS:
+            continue
+
+        async with pipe_lock:
+            idle_for = time.time() - last_activity_ts
+            if pipe is not None and idle_for >= UNLOAD_IDLE_SECONDS:
+                pipe = None
+                try:
+                    import gc
+                    import torch
+
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    # Keep startup resilient: do not hard-fail if model dependencies are missing.
+    # Pipeline is loaded lazily on first /api/edit request.
+    asyncio.create_task(unload_pipeline_if_idle())
 
 
 # ---------- Utilitaires ----------
@@ -223,13 +274,46 @@ async def run_endpoint_inference_multi(
     return [Image.open(io.BytesIO(response.content)).convert("RGB")]
 
 
+
+
+
+
+def runtime_backend_info() -> dict:
+    info = {"device_requested": DEVICE, "inference_mode": INFERENCE_MODE}
+    try:
+        import torch
+
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        info["cuda_device_count"] = int(torch.cuda.device_count())
+        if torch.cuda.is_available():
+            info["cuda_name"] = torch.cuda.get_device_name(0)
+    except Exception:
+        info["cuda_available"] = False
+        info["cuda_device_count"] = 0
+    return info
+
+def verify_api_token(authorization: Optional[str] = Header(default=None)) -> None:
+    if not API_TOKEN:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    if token != API_TOKEN:
+        raise HTTPException(401, "Invalid API token")
+
 # ---------- Routes ----------
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     return HTML
 
 
-@app.post("/api/edit")
+@app.get("/healthz")
+async def healthz() -> JSONResponse:
+    meta = runtime_backend_info()
+    return JSONResponse({"status": "ok", "mode": INFERENCE_MODE, "pipeline": pipeline_name, "loaded": pipe is not None, **meta})
+
+
+@app.post("/api/edit", dependencies=[Depends(verify_api_token)])
 async def api_edit(
     files: List[UploadFile] = File(..., description="Une ou plusieurs images"),
     prompt: str = Form(...),
@@ -240,6 +324,9 @@ async def api_edit(
     seed: Optional[str] = Form(None),
     max_side: int = Form(MAX_SIDE_DEFAULT),
 ) -> JSONResponse:
+    global last_activity_ts
+    last_activity_ts = time.time()
+
     if not prompt or not prompt.strip():
         raise HTTPException(400, "Prompt requis")
 
@@ -277,6 +364,10 @@ async def api_edit(
             seed_value,
         )
     else:
+        try:
+            await ensure_local_pipeline_loaded()
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
         out_imgs = await run_local_inference_multi(
             imgs,
             prompt,
@@ -295,7 +386,7 @@ async def api_edit(
             "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
         )
 
-    return JSONResponse({"images_base64": outputs_base64, "pipeline": pipeline_name})
+    return JSONResponse({"images_base64": outputs_base64, "pipeline": pipeline_name, "mode": INFERENCE_MODE, "device": DEVICE})
 
 
 # ---------- HTML (front DSFR premium + drag&drop + comparaison) ----------
@@ -346,6 +437,11 @@ HTML = r"""
         <div class="fr-input-group fr-mb-2w">
           <label class="fr-label" for="neg">Negative prompt <span class="fr-text--xs fr-text-mention--grey">(optionnel)</span></label>
           <input id="neg" name="negative_prompt" class="fr-input" placeholder="artefacts, blur" />
+        </div>
+
+        <div class="fr-input-group fr-mb-2w">
+          <label class="fr-label" for="apiToken">API token <span class="fr-text--xs fr-text-mention--grey">(optionnel)</span></label>
+          <input id="apiToken" class="fr-input" type="password" placeholder="Bearer token" />
         </div>
 
         <div class="fr-grid-row fr-grid-row--gutters fr-mb-2w">
@@ -424,6 +520,9 @@ const drop = document.getElementById('drop');
 const selInfo = document.getElementById('selInfo');
 const inThumbs = document.getElementById('inThumbs');
 const fileInput = document.getElementById('files');
+const apiTokenInput = document.getElementById('apiToken');
+apiTokenInput.value = localStorage.getItem('api_token') || '';
+apiTokenInput.addEventListener('change', ()=> localStorage.setItem('api_token', apiTokenInput.value.trim()));
 
 function fmtBytes(bytes){
   if (!bytes && bytes !== 0) return '—';
@@ -551,12 +650,15 @@ form.addEventListener('submit', async (e) => {
     });
 
   try{
-    const res = await fetch('/api/edit', { method:'POST', body: fd });
+    const headers = {};
+    if (apiTokenInput.value.trim()) headers['Authorization'] = `Bearer ${apiTokenInput.value.trim()}`;
+    const res = await fetch('/api/edit', { method:'POST', body: fd, headers });
     if(!res.ok){ throw new Error(await res.text()); }
     const data = await res.json();
     if(Array.isArray(data.images_base64)){
       showOutputs(fileInput.files, data.images_base64);
-      pipeSpan.textContent = data.pipeline || '—';
+      const mode = data.mode ? ` (${data.mode}/${data.device || ''})` : '';
+      pipeSpan.textContent = (data.pipeline || '—') + mode;
       statusEl.textContent = '✅ Fini';
     } else {
       throw new Error('Réponse invalide');
