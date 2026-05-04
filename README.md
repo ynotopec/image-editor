@@ -98,3 +98,5 @@ WantedBy=multi-user.target
 ## Notes dépendances performance
 
 - `accelerate` est inclus dans les dépendances pour améliorer le chargement modèle (moins de RAM CPU, init plus rapide).
+
+- `torchvision` est requis par certains processeurs Qwen2VL (sinon erreur au chargement pipeline).
