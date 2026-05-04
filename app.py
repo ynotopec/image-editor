@@ -271,6 +271,17 @@ async def run_endpoint_inference_multi(
     return [Image.open(io.BytesIO(response.content)).convert("RGB")]
 
 
+
+
+def verify_api_token(authorization: Optional[str] = Header(default=None)) -> None:
+    if not API_TOKEN:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    if token != API_TOKEN:
+        raise HTTPException(401, "Invalid API token")
+
 # ---------- Routes ----------
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
