@@ -100,3 +100,10 @@ WantedBy=multi-user.target
 - `accelerate` est inclus dans les dépendances pour améliorer le chargement modèle (moins de RAM CPU, init plus rapide).
 
 - `torchvision` est requis par certains processeurs Qwen2VL (sinon erreur au chargement pipeline).
+
+
+## Dépannage (GPU à 0%)
+
+- Vérifiez `GET /healthz`: `mode` doit être `local`, `device_requested` doit être `cuda`, et `cuda_available` doit être `true`.
+- Si `mode=endpoint`, l'inférence se fait à distance (GPU local restera à 0%).
+- Si `cuda_available=false` avec `DEVICE=cuda`, le serveur retournera une erreur explicite (pilotes/CUDA/runtime conteneur à corriger).

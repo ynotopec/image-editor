@@ -64,6 +64,9 @@ async def ensure_local_pipeline_loaded() -> None:
             except Exception:
                 QwenImageEditPlusPipeline = None  # type: ignore
 
+            if DEVICE.startswith("cuda") and not torch.cuda.is_available():
+                raise RuntimeError("DEVICE=cuda mais CUDA indisponible. Vérifiez pilotes NVIDIA/CUDA et le runtime du conteneur.")
+
             dtype_map = {
                 "bfloat16": torch.bfloat16,
                 "float16": torch.float16,
@@ -273,6 +276,22 @@ async def run_endpoint_inference_multi(
 
 
 
+
+
+def runtime_backend_info() -> dict:
+    info = {"device_requested": DEVICE, "inference_mode": INFERENCE_MODE}
+    try:
+        import torch
+
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        info["cuda_device_count"] = int(torch.cuda.device_count())
+        if torch.cuda.is_available():
+            info["cuda_name"] = torch.cuda.get_device_name(0)
+    except Exception:
+        info["cuda_available"] = False
+        info["cuda_device_count"] = 0
+    return info
+
 def verify_api_token(authorization: Optional[str] = Header(default=None)) -> None:
     if not API_TOKEN:
         return
@@ -290,7 +309,8 @@ async def index() -> str:
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    return JSONResponse({"status": "ok", "mode": INFERENCE_MODE, "pipeline": pipeline_name, "loaded": pipe is not None})
+    meta = runtime_backend_info()
+    return JSONResponse({"status": "ok", "mode": INFERENCE_MODE, "pipeline": pipeline_name, "loaded": pipe is not None, **meta})
 
 
 @app.post("/api/edit", dependencies=[Depends(verify_api_token)])
@@ -366,7 +386,7 @@ async def api_edit(
             "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
         )
 
-    return JSONResponse({"images_base64": outputs_base64, "pipeline": pipeline_name})
+    return JSONResponse({"images_base64": outputs_base64, "pipeline": pipeline_name, "mode": INFERENCE_MODE, "device": DEVICE})
 
 
 # ---------- HTML (front DSFR premium + drag&drop + comparaison) ----------
@@ -637,7 +657,8 @@ form.addEventListener('submit', async (e) => {
     const data = await res.json();
     if(Array.isArray(data.images_base64)){
       showOutputs(fileInput.files, data.images_base64);
-      pipeSpan.textContent = data.pipeline || '—';
+      const mode = data.mode ? ` (${data.mode}/${data.device || ''})` : '';
+      pipeSpan.textContent = (data.pipeline || '—') + mode;
       statusEl.textContent = '✅ Fini';
     } else {
       throw new Error('Réponse invalide');
