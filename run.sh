@@ -22,4 +22,4 @@ fi
 source "$VENV_DIR/bin/activate"
 cd "$PROJECT_DIR"
 
-exec uv run uvicorn app:app --host "$HOST" --port "$PORT"
+exec uv run --active uvicorn app:app --host "$HOST" --port "$PORT"

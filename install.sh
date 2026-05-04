@@ -24,9 +24,9 @@ source "$VENV_DIR/bin/activate"
 cd "$PROJECT_DIR"
 
 if [ -f "uv.lock" ]; then
-  uv sync --frozen
+  uv sync --active --frozen
 else
-  uv sync
+  uv sync --active
 fi
 
 echo "[install] Done. Activate with: source $VENV_DIR/bin/activate"
