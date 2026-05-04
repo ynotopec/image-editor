@@ -93,3 +93,8 @@ WantedBy=multi-user.target
 - `DTYPE=bfloat16` recommandé
 - pilotes NVIDIA + CUDA correctement installés côté hôte
 - ajuster `MAX_SIDE` et batch d'images selon la VRAM disponible
+
+
+## Notes dépendances performance
+
+- `accelerate` est inclus dans les dépendances pour améliorer le chargement modèle (moins de RAM CPU, init plus rapide).
