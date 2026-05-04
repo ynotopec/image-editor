@@ -12,18 +12,19 @@ import io
 import os
 from typing import List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image
 
 INFERENCE_MODE = os.getenv("INFERENCE_MODE", "local").lower()  # "local" | "endpoint"
-MODEL_ID = os.getenv("MODEL_ID", "dx8152/Qwen-Edit-2509-Multiple-angles")
+MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen-Image-Edit-2511")
 ENDPOINT_URL = os.getenv("ENDPOINT_URL", "")  # si INFERENCE_MODE=endpoint
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 DEVICE = os.getenv("DEVICE", "cuda")  # "cuda" | "cpu"
 DTYPE = os.getenv("DTYPE", "bfloat16")  # "bfloat16" | "float16" | "float32"
 MAX_SIDE_DEFAULT = int(os.getenv("MAX_SIDE", 1280))
+API_TOKEN = os.getenv("API_TOKEN", "")
 
 app = FastAPI(title="Qwen-Image-Edit — Web Studio (multi)")
 app.add_middleware(
@@ -57,7 +58,7 @@ if INFERENCE_MODE == "local":
 
         plus_cls = globals().get("QwenImageEditPlusPipeline")
         use_plus = (
-            ("2509" in MODEL_ID or MODEL_ID.endswith("-2509"))
+            (any(tag in MODEL_ID for tag in ("2509", "2511", "Multiple-Angles", "LoRA")))
             and plus_cls is not None
         )
         if use_plus:
@@ -76,6 +77,17 @@ if INFERENCE_MODE == "local":
     except Exception as exc:  # pragma: no cover - import/runtime guard
         raise RuntimeError(f"Échec du chargement du pipeline local: {exc}")
 
+
+
+
+def verify_api_token(authorization: Optional[str] = Header(default=None)) -> None:
+    if not API_TOKEN:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    if token != API_TOKEN:
+        raise HTTPException(401, "Invalid API token")
 
 # ---------- Utilitaires ----------
 
@@ -229,7 +241,12 @@ async def index() -> str:
     return HTML
 
 
-@app.post("/api/edit")
+@app.get("/healthz")
+async def healthz() -> JSONResponse:
+    return JSONResponse({"status": "ok", "mode": INFERENCE_MODE, "pipeline": pipeline_name})
+
+
+@app.post("/api/edit", dependencies=[Depends(verify_api_token)])
 async def api_edit(
     files: List[UploadFile] = File(..., description="Une ou plusieurs images"),
     prompt: str = Form(...),
@@ -348,6 +365,11 @@ HTML = r"""
           <input id="neg" name="negative_prompt" class="fr-input" placeholder="artefacts, blur" />
         </div>
 
+        <div class="fr-input-group fr-mb-2w">
+          <label class="fr-label" for="apiToken">API token <span class="fr-text--xs fr-text-mention--grey">(optionnel)</span></label>
+          <input id="apiToken" class="fr-input" type="password" placeholder="Bearer token" />
+        </div>
+
         <div class="fr-grid-row fr-grid-row--gutters fr-mb-2w">
           <div class="fr-col-12">
             <label for="steps" class="fr-label">Steps <span id="stepsValue" class="fr-badge fr-badge--new fr-ml-1w">30</span></label>
@@ -424,6 +446,9 @@ const drop = document.getElementById('drop');
 const selInfo = document.getElementById('selInfo');
 const inThumbs = document.getElementById('inThumbs');
 const fileInput = document.getElementById('files');
+const apiTokenInput = document.getElementById('apiToken');
+apiTokenInput.value = localStorage.getItem('api_token') || '';
+apiTokenInput.addEventListener('change', ()=> localStorage.setItem('api_token', apiTokenInput.value.trim()));
 
 function fmtBytes(bytes){
   if (!bytes && bytes !== 0) return '—';
@@ -551,7 +576,9 @@ form.addEventListener('submit', async (e) => {
     });
 
   try{
-    const res = await fetch('/api/edit', { method:'POST', body: fd });
+    const headers = {};
+    if (apiTokenInput.value.trim()) headers['Authorization'] = `Bearer ${apiTokenInput.value.trim()}`;
+    const res = await fetch('/api/edit', { method:'POST', body: fd, headers });
     if(!res.ok){ throw new Error(await res.text()); }
     const data = await res.json();
     if(Array.isArray(data.images_base64)){
