@@ -23,7 +23,7 @@ cp .env.example .env
 Variables importantes dans `.env.example`:
 - `API_TOKEN` (token d'accès API)
 - `INFERENCE_MODE`, `MODEL_ID` (défaut recommandé: `Qwen/Qwen-Image-Edit-2511`), `DEVICE`, `DTYPE`
-- options commentées avec `#` pour valeurs optionnelles/défaut.
+- options commentées avec `#` pour valeurs optionnelles/défaut (dont `UNLOAD_IDLE_SECONDS=300` pour décharger le modèle après inactivité).
 
 ## 3) Lancement
 
@@ -44,6 +44,8 @@ source ./run.sh 0.0.0.0 8080
 ```bash
 curl http://127.0.0.1:8080/healthz
 ```
+
+Retourne aussi `loaded: true|false` pour indiquer si le modèle est actuellement en mémoire.
 
 ### Edit endpoint
 ```bash

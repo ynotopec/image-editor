@@ -10,6 +10,7 @@ import asyncio
 import base64
 import io
 import os
+import time
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -25,6 +26,10 @@ DEVICE = os.getenv("DEVICE", "cuda")  # "cuda" | "cpu"
 DTYPE = os.getenv("DTYPE", "bfloat16")  # "bfloat16" | "float16" | "float32"
 MAX_SIDE_DEFAULT = int(os.getenv("MAX_SIDE", 1280))
 API_TOKEN = os.getenv("API_TOKEN", "")
+UNLOAD_IDLE_SECONDS = int(os.getenv("UNLOAD_IDLE_SECONDS", "300"))
+
+last_activity_ts = time.time()
+pipe_lock = asyncio.Lock()
 
 app = FastAPI(title="Qwen-Image-Edit — Web Studio (multi)")
 app.add_middleware(
@@ -38,56 +43,87 @@ app.add_middleware(
 # ---------- Chargement pipeline local ----------
 pipe = None
 pipeline_name = "QwenImageEditPipeline"
-if INFERENCE_MODE == "local":
-    try:
-        import torch
-        from diffusers import QwenImageEditPipeline
-
-        try:
-            # Nouveau pipeline pour 2509 (multi-images amélioré)
-            from diffusers import QwenImageEditPlusPipeline  # type: ignore
-        except Exception:  # pragma: no cover - diffusers < 0.32
-            QwenImageEditPlusPipeline = None  # type: ignore
-
-        dtype_map = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }
-        torch.set_grad_enabled(False)
-
-        plus_cls = globals().get("QwenImageEditPlusPipeline")
-        use_plus = (
-            (any(tag in MODEL_ID for tag in ("2509", "2511", "Multiple-Angles", "LoRA")))
-            and plus_cls is not None
-        )
-        if use_plus:
-            pipe = plus_cls.from_pretrained(
-                MODEL_ID,
-                torch_dtype=dtype_map.get(DTYPE, torch.bfloat16),
-            )
-            pipeline_name = "QwenImageEditPlusPipeline"
-        else:
-            pipe = QwenImageEditPipeline.from_pretrained(MODEL_ID)
-            pipe.to(dtype_map.get(DTYPE, torch.bfloat16))
-            pipeline_name = "QwenImageEditPipeline"
-
-        pipe.to(DEVICE)
-        pipe.set_progress_bar_config(disable=None)
-    except Exception as exc:  # pragma: no cover - import/runtime guard
-        raise RuntimeError(f"Échec du chargement du pipeline local: {exc}")
 
 
-
-
-def verify_api_token(authorization: Optional[str] = Header(default=None)) -> None:
-    if not API_TOKEN:
+async def ensure_local_pipeline_loaded() -> None:
+    global pipe, pipeline_name
+    if INFERENCE_MODE != "local":
         return
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing bearer token")
-    token = authorization.removeprefix("Bearer ").strip()
-    if token != API_TOKEN:
-        raise HTTPException(401, "Invalid API token")
+    if pipe is not None:
+        return
+
+    async with pipe_lock:
+        if pipe is not None:
+            return
+        try:
+            import torch
+            from diffusers import QwenImageEditPipeline
+
+            try:
+                from diffusers import QwenImageEditPlusPipeline  # type: ignore
+            except Exception:
+                QwenImageEditPlusPipeline = None  # type: ignore
+
+            dtype_map = {
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+                "float32": torch.float32,
+            }
+            torch.set_grad_enabled(False)
+
+            use_plus = (
+                any(tag in MODEL_ID for tag in ("2509", "2511", "Multiple-Angles", "LoRA"))
+                and QwenImageEditPlusPipeline is not None
+            )
+            if use_plus:
+                pipe = QwenImageEditPlusPipeline.from_pretrained(
+                    MODEL_ID,
+                    torch_dtype=dtype_map.get(DTYPE, torch.bfloat16),
+                )
+                pipeline_name = "QwenImageEditPlusPipeline"
+            else:
+                pipe = QwenImageEditPipeline.from_pretrained(MODEL_ID)
+                pipe.to(dtype_map.get(DTYPE, torch.bfloat16))
+                pipeline_name = "QwenImageEditPipeline"
+
+            pipe.to(DEVICE)
+            pipe.set_progress_bar_config(disable=None)
+        except Exception as exc:
+            raise RuntimeError(f"Échec du chargement du pipeline local: {exc}")
+
+
+async def unload_pipeline_if_idle() -> None:
+    global pipe
+    if INFERENCE_MODE != "local" or UNLOAD_IDLE_SECONDS <= 0:
+        return
+
+    while True:
+        await asyncio.sleep(15)
+        idle_for = time.time() - last_activity_ts
+        if idle_for < UNLOAD_IDLE_SECONDS:
+            continue
+
+        async with pipe_lock:
+            idle_for = time.time() - last_activity_ts
+            if pipe is not None and idle_for >= UNLOAD_IDLE_SECONDS:
+                pipe = None
+                try:
+                    import gc
+                    import torch
+
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    if INFERENCE_MODE == "local":
+        await ensure_local_pipeline_loaded()
+    asyncio.create_task(unload_pipeline_if_idle())
+
 
 # ---------- Utilitaires ----------
 
@@ -243,7 +279,7 @@ async def index() -> str:
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    return JSONResponse({"status": "ok", "mode": INFERENCE_MODE, "pipeline": pipeline_name})
+    return JSONResponse({"status": "ok", "mode": INFERENCE_MODE, "pipeline": pipeline_name, "loaded": pipe is not None})
 
 
 @app.post("/api/edit", dependencies=[Depends(verify_api_token)])
@@ -257,6 +293,9 @@ async def api_edit(
     seed: Optional[str] = Form(None),
     max_side: int = Form(MAX_SIDE_DEFAULT),
 ) -> JSONResponse:
+    global last_activity_ts
+    last_activity_ts = time.time()
+
     if not prompt or not prompt.strip():
         raise HTTPException(400, "Prompt requis")
 
@@ -294,6 +333,7 @@ async def api_edit(
             seed_value,
         )
     else:
+        await ensure_local_pipeline_loaded()
         out_imgs = await run_local_inference_multi(
             imgs,
             prompt,
